@@ -13,7 +13,12 @@ This gate runs a short ``docker run`` per runtime-testable rule and asserts the
 premise holds. It is the runtime arm of the rule-grounding bar: a new rule must
 either cite a container-context source or pass a check here.
 
-Usage: ``python scripts/validate_rule_premises.py`` (needs a working Docker).
+Usage: ``python scripts/validate_rule_premises.py`` (needs a working **rootful**
+Docker). Under rootless Docker several checks fail spuriously: the kernel
+authorizes SYS_NICE/SYS_TIME/IPC_LOCK in the *init* user namespace, so their
+allow legs fail even with the capability granted, and the socket-mount and
+/dev/kmsg checks assume rootful paths. CI runs rootful; treat rootless-local
+failures as environmental.
 Exits 0 if every premise holds (or Docker is unavailable → skipped), 1 on any
 failure. Rules that describe image/supply-chain or config-only concerns
 (CL-0004, CL-0014, CL-0015, CL-0019, CL-0020, CL-0021) have no runtime state to
@@ -33,6 +38,11 @@ if TYPE_CHECKING:
 # Pinned by manifest-list (OCI index) digest so CI uses no mutable ref.
 IMAGE = (
     "busybox@sha256:fd8d9aa63ba2f0982b5304e1ee8d3b90a210bc1ffb5314d980eb6962f1a9715d"
+)
+# python:3.13-alpine — used only by the IPC_LOCK mapping check: proving the
+# mlockall(2) -> CAP_IPC_LOCK mapping needs a libc caller busybox doesn't ship.
+PY_IMAGE = (
+    "python@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0"
 )
 # Rules with nothing to observe in a live container — grounded by source only.
 _NON_RUNTIME = ["CL-0004", "CL-0014", "CL-0015", "CL-0019", "CL-0020", "CL-0021"]
@@ -215,6 +225,256 @@ def _cl0022() -> tuple[bool, str]:
     ), f"default has noexec={'noexec' in base}, :exec has noexec={'noexec' in ex}"
 
 
+# --- CL-0006 symptom-table mappings (docs/rules/CL-0006.md) -----------------
+#
+# The rule doc's "Determining required capabilities" table quotes verbatim
+# error messages and maps each to a capability. Each check here re-proves one
+# row against a live container: the operation must FAIL under ``cap_drop: ALL``
+# emitting the quoted message, and SUCCEED with only the mapped capability
+# added. This catches engine drift — e.g. Docker 20.10 setting
+# ``ip_unprivileged_port_start=0`` silently invalidated the old "low ports need
+# NET_BIND_SERVICE" folklore, which is exactly the kind of change these checks
+# turn into a CI failure instead of stale documentation (#468).
+
+
+def _run_err(args: list[str], cmd: list[str], image: str = IMAGE) -> tuple[int, str]:
+    """``docker run --rm <args> <image> <cmd>`` → (returncode, stderr).
+
+    The capability-failure messages the CL-0006 table quotes are emitted on
+    stderr, so this helper returns stderr where ``_run`` returns stdout.
+    """
+    proc = subprocess.run(
+        ["docker", "run", "--rm", *args, image, *cmd],
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    return proc.returncode, proc.stderr.strip()
+
+
+def _mapping(
+    caps: list[str],
+    cmd: list[str],
+    msg: str,
+    args: list[str] | None = None,
+    image: str = IMAGE,
+) -> tuple[bool, str]:
+    """Prove one symptom→capability row (fails capless with ``msg``; works
+    with only ``caps`` added)."""
+    extra = args or []
+    rc_deny, err = _run_err(["--cap-drop", "ALL", *extra], cmd, image)
+    add = [flag for cap in caps for flag in ("--cap-add", cap)]
+    rc_allow, _ = _run_err(["--cap-drop", "ALL", *add, *extra], cmd, image)
+    ok = rc_deny != 0 and msg in err and rc_allow == 0
+    return ok, f"denied rc={rc_deny} msg={err!r}; with {'+'.join(caps)} rc={rc_allow}"
+
+
+def _t_chown() -> tuple[bool, str]:
+    return _mapping(
+        ["CHOWN"],
+        ["sh", "-c", "touch /tmp/f && chown 1000:1000 /tmp/f"],
+        "chown: /tmp/f: Operation not permitted",
+    )
+
+
+def _t_fowner() -> tuple[bool, str]:
+    # A chmod probe is a no-op on a root-owned file — FOWNER only gates files
+    # owned by *another* uid, so stage a foreign-owned dir via tmpfs uid=.
+    return _mapping(
+        ["FOWNER"],
+        ["chmod", "0755", "/work"],
+        "chmod: /work: Operation not permitted",
+        args=["--tmpfs", "/work:uid=1000,mode=0700"],
+    )
+
+
+def _t_setuid_setgid() -> tuple[bool, str]:
+    return _mapping(
+        ["SETUID", "SETGID"],
+        ["su", "nobody", "-s", "/bin/sh", "-c", "true"],
+        "su: can't set groups: Operation not permitted",
+    )
+
+
+def _t_net_bind_service() -> tuple[bool, str]:
+    # Only meaningful under a hardened ip_unprivileged_port_start: Docker
+    # 20.10+ defaults the sysctl to 0 in each container's own network
+    # namespace, so the loose leg must bind :80 with NO capability at all —
+    # that default going away (or the hardened leg passing capless) is drift.
+    # Poll for the listening socket instead of a fixed sleep — on a loaded
+    # runner the fork-to-bind can exceed any single guess, and nc's own exit
+    # status is swallowed by the backgrounding.
+    bind = [
+        "sh",
+        "-c",
+        "nc -l -p 80 -w 3 & i=0; while [ $i -lt 20 ]; do "
+        "netstat -tln | grep -q ':80 ' && exit 0; "
+        "i=$((i+1)); sleep 0.1; done; exit 1",
+    ]
+    hard = ["--sysctl", "net.ipv4.ip_unprivileged_port_start=1024"]
+    rc_loose, _ = _run_err(["--cap-drop", "ALL"], bind)
+    rc_deny, err = _run_err(["--cap-drop", "ALL", *hard], bind)
+    rc_allow, _ = _run_err(
+        ["--cap-drop", "ALL", "--cap-add", "NET_BIND_SERVICE", *hard], bind
+    )
+    ok = (
+        rc_loose == 0
+        and rc_deny != 0
+        and "nc: bind: Permission denied" in err
+        and rc_allow == 0
+    )
+    return ok, (
+        f"loose capless rc={rc_loose}; hardened rc={rc_deny} msg={err!r}; "
+        f"hardened with cap rc={rc_allow}"
+    )
+
+
+def _t_net_raw() -> tuple[bool, str]:
+    # busybox ping uses a raw socket; other ping builds work capless via ICMP
+    # datagram sockets (the doc notes the tool-dependence).
+    return _mapping(
+        ["NET_RAW"],
+        ["ping", "-c1", "-W1", "127.0.0.1"],
+        "ping: permission denied (are you root?)",
+    )
+
+
+def _t_mknod() -> tuple[bool, str]:
+    return _mapping(
+        ["MKNOD"],
+        ["mknod", "/tmp/null0", "c", "1", "3"],
+        "mknod: /tmp/null0: Operation not permitted",
+    )
+
+
+def _t_net_admin() -> tuple[bool, str]:
+    # Route change in the container's own netns — NET_ADMIN is netns-scoped,
+    # so granting it here touches nothing outside the container.
+    return _mapping(
+        ["NET_ADMIN"],
+        ["ip", "route", "add", "192.0.2.0/24", "dev", "lo"],
+        "ip: RTNETLINK answers: Operation not permitted",
+    )
+
+
+def _t_sys_nice() -> tuple[bool, str]:
+    # Note EACCES ("Permission denied"), not EPERM — setpriority(2)'s
+    # documented errno for lowering nice without privilege.
+    return _mapping(
+        ["SYS_NICE"],
+        ["renice", "-n", "-5", "-p", "1"],
+        "renice: setpriority: Permission denied",
+    )
+
+
+_SETTIME_PROBE = (
+    "import ctypes,os,sys\n"
+    "libc=ctypes.CDLL(None,use_errno=True)\n"
+    "class TS(ctypes.Structure):\n"
+    "    _fields_=[('tv_sec',ctypes.c_long),('tv_nsec',ctypes.c_long)]\n"
+    "ts=TS()\n"
+    "libc.clock_gettime(0,ctypes.byref(ts))\n"
+    "if libc.clock_settime(0,ctypes.byref(ts))!=0:\n"
+    "    print('clock_settime: '+os.strerror(ctypes.get_errno()),file=sys.stderr)\n"
+    "    sys.exit(1)\n"
+)
+
+
+def _t_sys_time() -> tuple[bool, str]:
+    # Deny leg: busybox `date -s`, keyed on the quoted message rather than the
+    # exit code — busybox builds differ on whether a settime failure is fatal
+    # (ours exits 1; upstream has shipped variants that print and exit 0).
+    # Allow leg: a clock_gettime→clock_settime round-trip of the same timespec.
+    # CLOCK_REALTIME is not namespaced, so proving the grant touches the HOST
+    # clock — the round-trip bounds that to microseconds of drift instead of
+    # `date -s`'s up-to-a-second backward step.
+    # Set-to-now even on the deny leg: if a broken engine ever let it through,
+    # the "failure" must still be a harmless no-op, never a step to epoch 0.
+    rc_deny, err = _run_err(["--cap-drop", "ALL"], ["sh", "-c", "date -s @$(date +%s)"])
+    rc_allow, allow_err = _run_err(
+        ["--cap-drop", "ALL", "--cap-add", "SYS_TIME"],
+        ["python", "-c", _SETTIME_PROBE],
+        image=PY_IMAGE,
+    )
+    msg = "date: can't set date: Operation not permitted"
+    ok = msg in err and rc_allow == 0
+    return ok, (
+        f"denied msg={err!r}; settime round-trip with SYS_TIME "
+        f"rc={rc_allow} {allow_err!r}"
+    )
+
+
+def _t_kill() -> tuple[bool, str]:
+    # kill(2) across uids: PID 1 runs as uid 1000, the exec'd root shell
+    # (inheriting the container's dropped caps) signals it — EPERM without
+    # CAP_KILL even for root.
+    def attempt(extra: list[str]) -> tuple[int, str]:
+        create = subprocess.run(
+            [
+                "docker",
+                "run",
+                "-d",
+                "--cap-drop",
+                "ALL",
+                *extra,
+                "--user",
+                "1000",
+                IMAGE,
+                "sleep",
+                "60",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        cid = create.stdout.strip()
+        if create.returncode != 0 or not cid:
+            # Surface as an environment error, not a premise verdict.
+            raise RuntimeError(f"container create failed: {create.stderr.strip()!r}")
+        try:
+            proc = subprocess.run(
+                ["docker", "exec", "-u", "0", cid, "kill", "-TERM", "1"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            return proc.returncode, proc.stderr.strip()
+        finally:
+            subprocess.run(["docker", "rm", "-f", cid], capture_output=True)
+
+    rc_deny, err = attempt([])
+    rc_allow, _ = attempt(["--cap-add", "KILL"])
+    ok = (
+        rc_deny != 0
+        and "kill: can't kill pid 1: Operation not permitted" in err
+        and rc_allow == 0
+    )
+    return ok, f"denied rc={rc_deny} msg={err!r}; with KILL rc={rc_allow}"
+
+
+_MLOCK_PROBE = (
+    "import ctypes,os,sys\n"
+    "libc=ctypes.CDLL(None,use_errno=True)\n"
+    "if libc.mlockall(1)!=0:\n"
+    "    print('mlockall: '+os.strerror(ctypes.get_errno()),file=sys.stderr)\n"
+    "    sys.exit(1)\n"
+)
+
+
+def _t_ipc_lock() -> tuple[bool, str]:
+    # mlockall(2) with RLIMIT_MEMLOCK=0: EPERM without CAP_IPC_LOCK, allowed
+    # with it (the cap bypasses the rlimit) — the vault/elasticsearch
+    # memory-lock pattern. Docker's default memlock limit permits small locks
+    # capless, so the rlimit must be pinned to 0 to expose the mapping.
+    return _mapping(
+        ["IPC_LOCK"],
+        ["python", "-c", _MLOCK_PROBE],
+        "mlockall: Operation not permitted",
+        args=["--ulimit", "memlock=0:0"],
+        image=PY_IMAGE,
+    )
+
+
 CHECKS: list[tuple[str, str, Callable[[], tuple[bool, str]]]] = [
     ("CL-0001", "docker socket mount is root-equivalent", _cl0001),
     ("CL-0002", "privileged grants full caps", _cl0002),
@@ -232,6 +492,18 @@ CHECKS: list[tuple[str, str, Callable[[], tuple[bool, str]]]] = [
     ("CL-0017", "shared propagation is observable", _cl0017),
     ("CL-0018", "explicit user maps to that uid", _cl0018),
     ("CL-0022", "tmpfs noexec by default; :exec removes it", _cl0022),
+    # CL-0006 symptom-table mappings — one per row of the rule doc's table.
+    ("CL-0006", "map: chown -> CHOWN", _t_chown),
+    ("CL-0006", "map: chmod on foreign-owned -> FOWNER", _t_fowner),
+    ("CL-0006", "map: user switch -> SETUID+SETGID", _t_setuid_setgid),
+    ("CL-0006", "map: hardened low-port bind -> NET_BIND_SERVICE", _t_net_bind_service),
+    ("CL-0006", "map: raw-socket ping -> NET_RAW", _t_net_raw),
+    ("CL-0006", "map: mknod -> MKNOD", _t_mknod),
+    ("CL-0006", "map: route change -> NET_ADMIN", _t_net_admin),
+    ("CL-0006", "map: renice -> SYS_NICE", _t_sys_nice),
+    ("CL-0006", "map: set clock -> SYS_TIME", _t_sys_time),
+    ("CL-0006", "map: cross-uid signal -> KILL", _t_kill),
+    ("CL-0006", "map: mlockall -> IPC_LOCK", _t_ipc_lock),
 ]
 
 
@@ -267,6 +539,24 @@ def main() -> int:
             print(line, file=sys.stderr)
         return 1 if os.environ.get("CL_REQUIRE_DOCKER") == "1" else 0
 
+    # Pre-pull the pinned images so a registry failure (network outage, Docker
+    # Hub rate limit) fails loudly HERE as infrastructure, instead of surfacing
+    # inside a check's 90s timeout and being misread as premise drift.
+    for image in (IMAGE, PY_IMAGE):
+        pull = subprocess.run(
+            ["docker", "pull", "-q", image],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        if pull.returncode != 0:
+            print(
+                f"IMAGE PULL FAILED (infrastructure, not premise drift): {image}\n"
+                f"{pull.stderr.strip()}",
+                file=sys.stderr,
+            )
+            return 1
+
     failures = []
     for rule_id, label, check in CHECKS:
         try:
@@ -276,7 +566,9 @@ def main() -> int:
         mark = "PASS" if ok else "FAIL"
         print(f"  [{mark}] {rule_id}  {label}\n          {detail}")
         if not ok:
-            failures.append(rule_id)
+            # Include the label: 12 rows share rule_id CL-0006, and a bare
+            # "CL-0006, CL-0006" summary hides which mapping broke.
+            failures.append(f"{rule_id} ({label})")
 
     print()
     print(f"not runtime-testable (grounded by source): {', '.join(_NON_RUNTIME)}")
