@@ -13,6 +13,16 @@ This gate runs a short ``docker run`` per runtime-testable rule and asserts the
 premise holds. It is the runtime arm of the rule-grounding bar: a new rule must
 either cite a container-context source or pass a check here.
 
+**This is a maintainer and CI tool, not part of the product.** Nothing in the
+installed package opens a socket: ``check``, ``fix`` and ``--explain`` are pure
+YAML analysis, the wheel does not ship this file, and the corpus pipeline never
+touches a daemon either. It runs in CI's ``rule-premises`` job and by hand — a
+user of compose-lint will never see its output, including the posture note.
+What it validates is a rule's *premise*, on a daemon at Docker's documented
+defaults, so that the word "verified" on a rule page means something specific.
+It says nothing about the daemon a compose file will eventually be deployed to
+(ADR-020) — compose-lint never sees that host.
+
 Usage: ``python scripts/validate_rule_premises.py`` (needs a working **rootful**
 Docker). Under rootless Docker several checks fail spuriously: the kernel
 authorizes SYS_NICE/SYS_TIME/IPC_LOCK in the *init* user namespace, so their
@@ -21,7 +31,7 @@ allow legs fail even with the capability granted, and the socket-mount and
 failures as environmental.
 Exits 0 if every premise holds (or Docker is unavailable → skipped), 1 on any
 failure. Rules that describe image/supply-chain or config-only concerns
-(CL-0004, CL-0014, CL-0015, CL-0019, CL-0020, CL-0021) have no runtime state to
+(CL-0004, CL-0014, CL-0019, CL-0020, CL-0021) have no runtime state to
 observe and are listed as intentionally out of scope.
 """
 
@@ -46,7 +56,88 @@ PY_IMAGE = (
     "python@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0"
 )
 # Rules with nothing to observe in a live container — grounded by source only.
-_NON_RUNTIME = ["CL-0004", "CL-0014", "CL-0015", "CL-0019", "CL-0020", "CL-0021"]
+_NON_RUNTIME = ["CL-0004", "CL-0014", "CL-0019", "CL-0020", "CL-0021"]
+
+# Docker's default capability set, which is compiled into the daemon and has no
+# flag or daemon.json key. Every capability premise is measured against it.
+DEFAULT_CAPEFF = "00000000a80425fb"
+
+
+def _info(field: str) -> str:
+    """One projected field from ``docker info``.
+
+    Projected rather than dumped: the full ``docker info`` output carries
+    registry and proxy configuration, and nothing here needs it.
+    """
+    proc = subprocess.run(
+        ["docker", "info", "--format", field],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return proc.stdout.strip()
+
+
+def _posture() -> tuple[list[tuple[str, str, str]], str]:
+    """Report how the daemon under test departs from Docker's defaults.
+
+    ADR-020 grounds every rule against rootful Docker Engine at its default
+    configuration, so a premise measured elsewhere cannot be cited as evidence
+    for one. A departure does not stop the run: measured on a no-AppArmor
+    desktop, all 41 checks returned verdicts identical to the grounded host, so
+    refusing outright threw away a run that was almost entirely valid. What a
+    departure does is cost the run its authority — the caller marks it
+    non-authoritative and exits non-zero.
+
+    Note what this is *not*. It says nothing about the daemon a compose file
+    will eventually run on: compose-lint never sees that host (ADR-020). This
+    is about where the measurement was taken.
+
+    **A clause exists here only when a check depends on it.** The first draft
+    asserted five facts; two of them — an active LSM, and ``icc`` left on —
+    were not measured by any check in the suite, and the LSM clause was the one
+    that fired on the desktop run described above. Asserting a condition
+    speculatively, in case something later needs it, buys nothing and costs
+    false alarms. When the deferred CL-0006 ARP check lands it will depend on
+    ``icc``, and the ``icc`` clause lands with it.
+
+    Currently asserted, with what depends on each:
+
+    * **default capability set** — every "denied without the capability,
+      allowed with it" mapping.
+    * **builtin seccomp** — ``_cl0009``, which asserts a filter is active by
+      default.
+    * **no uid remapping** — ``_cl0018``, which asserts an explicit ``user:``
+      maps to that uid.
+
+    Returns ``(departures, security_options)``, where each departure is
+    ``(what departed, what was expected, what was observed)`` — a bare
+    "posture is wrong" leaves the reader to guess which setting and what to
+    change.
+    """
+    problems: list[tuple[str, str, str]] = []
+
+    opts = _info("{{.SecurityOptions}}")
+    if "seccomp,profile=builtin" not in opts:
+        problems.append(
+            ("seccomp is not the builtin profile", "name=seccomp,profile=builtin", opts)
+        )
+    if "name=userns" in opts:
+        problems.append(("userns-remap is enabled", "no name=userns", opts))
+
+    _, caps = _run([], ["sh", "-c", "grep ^CapEff /proc/self/status | tr -d '\t'"])
+    if not caps.endswith(DEFAULT_CAPEFF):
+        problems.append(
+            ("capability set is not Docker's default 14", DEFAULT_CAPEFF, caps)
+        )
+
+    _, uid_map = _run([], ["cat", "/proc/self/uid_map"])
+    if uid_map.split()[:2] != ["0", "0"]:
+        problems.append(
+            ("uid namespace is remapped", "uid_map starting '0 0'", uid_map)
+        )
+
+    return problems, opts
 
 
 def _run(args: list[str], cmd: list[str], image: str = IMAGE) -> tuple[int, str]:
@@ -162,20 +253,6 @@ def _cl0011() -> tuple[bool, str]:
     _, base = _run([], ["grep", "CapEff", "/proc/self/status"])
     _, added = _run(["--cap-add", "SYS_ADMIN"], ["grep", "CapEff", "/proc/self/status"])
     return (added != base), f"default={base} +SYS_ADMIN={added}"
-
-
-def _cl0012() -> tuple[bool, str]:
-    """pids_limit: -1 (the rule's trigger) leaves a high/unbounded cap.
-
-    A positive limit is enforced; ``-1`` leaves whatever the cgroup hierarchy
-    allows (``max`` on an unconstrained host, or a high parent cap), which is far
-    looser than a sane explicit limit — the insecure choice the rule flags.
-    """
-    _, unlim = _run(["--pids-limit", "-1"], ["cat", "/sys/fs/cgroup/pids.max"])
-    _, limited = _run(["--pids-limit", "100"], ["cat", "/sys/fs/cgroup/pids.max"])
-    u = unlim.strip()
-    high = u == "max" or (u.isdigit() and int(u) > 1000)
-    return (high and limited.strip() == "100"), f"-1={u} 100={limited.strip()}"
 
 
 def _cl0013() -> tuple[bool, str]:
@@ -555,21 +632,9 @@ def _t7_volume_writable() -> tuple[bool, str]:
     return ok, f"volume write rc={rc_vol}; rootfs write rc={rc_root} msg={err!r}"
 
 
-# --- CL-0012 / CL-0018 / CL-0022 symptom-table mappings (#479) --------------
+# --- CL-0018 / CL-0022 symptom-table mappings (#479) -----------------------
 #
 # Same contract as the CL-0006/CL-0007 mapping checks (ADR-016 amendment).
-
-
-def _t12_fork_limit() -> tuple[bool, str]:
-    # 40 background forks against a pids limit of 10 must fail; the same storm
-    # under a sane limit must not. The busybox wording is the doc's quoted row.
-    fork_script = "for i in $(seq 1 40); do sleep 2 & done"
-    return _remedy(
-        ["--pids-limit", "10"],
-        ["--pids-limit", "100"],
-        ["sh", "-c", fork_script],
-        "can't fork: Resource temporarily unavailable",
-    )
 
 
 def _t22_exec_tmpfs() -> tuple[bool, str]:
@@ -689,8 +754,262 @@ def _t3_drop_unaffected() -> tuple[bool, str]:
     return ok, f"root->nobody drop under nnp rc={rc} uid={out!r}"
 
 
-CHECKS: list[tuple[str, str, Callable[[], tuple[bool, str]]]] = [
+def _cl0001_ro_socket() -> tuple[bool, str]:
+    """``:ro`` does not neuter the socket — the API answers through it.
+
+    ``:ro`` sets the inode permissions on the socket *file*; the Docker API is
+    read-write over any connection that gets opened, so a read-only mount grants
+    the same control as a read-write one. Uses ``/_ping`` — the smallest
+    read-only endpoint — so the check makes no state-changing API call.
+    """
+    probe = (
+        "import socket;"
+        "s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);"
+        "s.connect('/var/run/docker.sock');"
+        "s.sendall(b'GET /_ping HTTP/1.1\\r\\nHost: docker\\r\\n\\r\\n');"
+        "print(s.recv(64).split(b'\\r\\n')[0].decode())"
+    )
+    _, out = _run(
+        ["-v", "/var/run/docker.sock:/var/run/docker.sock:ro"],
+        ["python", "-c", probe],
+        image=PY_IMAGE,
+    )
+    return ("200 OK" in out), f"ro-mounted socket answered: {out!r}"
+
+
+def _host_block_device() -> str:
+    """Name of a whole-disk block device on the *daemon's* host, or ""."""
+    _, dev = _run(
+        ["-v", "/dev:/hostdev:ro"],
+        [
+            "sh",
+            "-c",
+            "ls /hostdev | grep -E '^(nvme[0-9]+n[0-9]+|sd[a-z]|vd[a-z])$' | head -1",
+        ],
+    )
+    return dev
+
+
+def _cl0016_raw_disk() -> tuple[bool, str]:
+    """A block device mapped via ``devices:`` is readable at default caps.
+
+    This is what puts CL-0016 in the CRITICAL tier: no capability is added, no
+    technique is needed, and the read lands on the disk backing the host
+    filesystem. Reads one sector to /dev/null — nothing is written, and no disk
+    content reaches the output.
+    """
+    dev = _host_block_device()
+    if not dev:
+        return False, "no whole-disk block device found under the daemon host's /dev"
+    _, out = _run(
+        ["--device", f"/dev/{dev}:/dev/{dev}:r"],
+        ["sh", "-c", f"dd if=/dev/{dev} of=/dev/null bs=512 count=1 2>&1 | tail -1"],
+    )
+    return ("512 bytes" in out), f"/dev/{dev} via --device at default caps: {out!r}"
+
+
+def _cl0013_dev_bind_is_gated() -> tuple[bool, str]:
+    """A ``/dev`` bind conveys the nodes but not device-cgroup permission.
+
+    The negative control for ``_cl0016``: same host, same device, same default
+    capabilities — refused through a bind mount, allowed through ``--device``.
+    It is why CL-0013's ``/dev`` member is not equivalent to CL-0016.
+    """
+    dev = _host_block_device()
+    if not dev:
+        return False, "no whole-disk block device found under the daemon host's /dev"
+    _, out = _run(
+        ["-v", "/dev:/hostdev"],
+        [
+            "sh",
+            "-c",
+            f"dd if=/hostdev/{dev} of=/dev/null bs=512 count=1 2>&1 | tail -1",
+        ],
+    )
+    return ("not permitted" in out), f"/dev/{dev} via bind mount: {out!r}"
+
+
+def _cl0025_core_pattern() -> tuple[bool, str]:
+    """An rw ``/proc`` bind makes ``core_pattern`` writable at default caps.
+
+    Docker mounts the container's own ``/proc/sys`` read-only, but a bind mount
+    of the host's ``/proc`` arrives writable — which hands a container the
+    ability to point the host's core-dump handler at a program of its choosing.
+
+    The check writes back the value it just read, so the host's setting is
+    unchanged whether the write is permitted or refused.
+    """
+    script = (
+        "v=$(cat {root}/sys/kernel/core_pattern); "
+        'printf "%s\\n" "$v" > {root}/sys/kernel/core_pattern 2>/dev/null '
+        "&& echo WROTE || echo REFUSED"
+    )
+    _, bound = _run(
+        ["-v", "/proc:/hostproc"], ["sh", "-c", script.format(root="/hostproc")]
+    )
+    _, default = _run([], ["sh", "-c", script.format(root="/proc")])
+    ok = bound == "WROTE" and default == "REFUSED"
+    return ok, f"rw /proc bind={bound!r}, container's own /proc={default!r}"
+
+
+def _cl0026() -> tuple[bool, str]:
+    """Memory and CPU are both unbounded by default; a limit bounds them.
+
+    Docker imposes no default memory or CPU cap, so the absence CL-0026 flags is
+    genuinely the insecure default rather than a hardening preference.
+    """
+    read = "echo $(cat /sys/fs/cgroup/memory.max)/$(cat /sys/fs/cgroup/cpu.max)"
+    _, base = _run([], ["sh", "-c", read])
+    _, limited = _run(["--memory", "64m", "--cpus", "0.5"], ["sh", "-c", read])
+    mem, _, cpu = limited.partition("/")
+    ok = base.startswith("max/max ") and mem != "max" and not cpu.startswith("max")
+    return ok, f"default={base!r} limited={limited!r}"
+
+
+_PTRACE_PROBE = (
+    "import ctypes,os,subprocess,time,sys\n"
+    "libc=ctypes.CDLL('libc.so.6',use_errno=True)\n"
+    # Target runs as a DIFFERENT uid: same-uid tracing needs no capability at
+    # all, so tracing a peer uid is the only thing SYS_PTRACE actually adds.
+    "t=subprocess.Popen(['sleep','30'],user=65534)\n"
+    "time.sleep(0.5)\n"
+    "ctypes.set_errno(0)\n"
+    "r=libc.ptrace(16,t.pid,0,0)\n"
+    "e=ctypes.get_errno()\n"
+    "print('ATTACH_OK' if r==0 else os.strerror(e))\n"
+)
+
+
+def _t_sys_ptrace() -> tuple[bool, str]:
+    """SYS_PTRACE grants tracing of a *different-uid* process in this container.
+
+    CL-0027's impact is priced on this member, so it is the one reach that has
+    to be measured rather than reasoned. Same-uid tracing is not the grant --
+    it succeeds with every capability dropped -- and it is additionally
+    governed by ``kernel.yama.ptrace_scope``, which varies by distribution.
+    The cross-uid check is ``ptrace_may_access``'s capability test and does not
+    depend on that sysctl, which is why the probe crosses a uid boundary.
+
+    SETUID/SETGID are granted on *both* legs so the only variable is
+    SYS_PTRACE; without them the probe cannot spawn the target at all.
+    """
+    base = ["--cap-drop", "ALL", "--cap-add", "SETUID", "--cap-add", "SETGID"]
+    _, denied = _run(base, ["python", "-c", _PTRACE_PROBE], image=PY_IMAGE)
+    _, allowed = _run(
+        [*base, "--cap-add", "SYS_PTRACE"],
+        ["python", "-c", _PTRACE_PROBE],
+        image=PY_IMAGE,
+    )
+    ok = "ATTACH_OK" not in denied and "ATTACH_OK" in allowed
+    return ok, f"without SYS_PTRACE={denied!r}; with SYS_PTRACE={allowed!r}"
+
+
+def _t_dac_read_search() -> tuple[bool, str]:
+    """DAC_READ_SEARCH bypasses file-read checks *inside* the container.
+
+    The Shocker-style host read needs a host bind mount to resolve a handle
+    against, and that mount is flagged by CL-0013/CL-0025. Scored in isolation,
+    what the capability grants is this: reading a file the workload uid is
+    otherwise refused.
+    """
+    probe = "echo secret > /tmp/s; chmod 000 /tmp/s; chown 65534:65534 /tmp/s; cat /tmp/s"
+    _, denied = _run(["--cap-drop", "ALL"], ["sh", "-c", probe])
+    _, allowed = _run(["--cap-drop", "ALL", "--cap-add", "DAC_READ_SEARCH"], ["sh", "-c", probe])
+    ok = "secret" not in denied and allowed.strip() == "secret"
+    return ok, f"without={denied!r}; with={allowed!r}"
+
+
+_PERF_PROBE = (
+    "import ctypes,struct,os,sys\n"
+    "libc=ctypes.CDLL('libc.so.6',use_errno=True)\n"
+    "b=bytearray(128)\n"
+    "struct.pack_into('<I',b,0,1)\n"      # PERF_TYPE_SOFTWARE
+    "struct.pack_into('<I',b,4,128)\n"    # attr size
+    "a=(ctypes.c_char*128).from_buffer(b)\n"
+    "ctypes.set_errno(0)\n"
+    # pid=-1, cpu=0 -> system-wide, kernel samples included
+    "fd=libc.syscall(298,ctypes.byref(a),-1,0,-1,0)\n"
+    "print('PERF_OK' if fd>=0 else 'PERF_DENIED')\n"
+)
+
+
+def _t_perfmon() -> tuple[bool | None, str]:
+    """PERFMON opens a system-wide ``perf_event_open``; without it, nothing.
+
+    That is the premise CL-0028 prices its host-read member on, asserted at the
+    grounded posture (ADR-020: upstream kernel defaults), where ``perfmon_capable()``
+    lets the capability bypass ``perf_event_paranoid`` at any level.
+
+    An earlier version of this check tried to infer the expected result from
+    the sysctl value -- grant at <= 2, deny above -- and that is unsound. The
+    value is not predictive: measured, a CI runner at ``perf_event_paranoid=4``
+    **granted**, while Debian 13 at 3 **denied**, and Arch at 2 granted. What
+    actually decides it is whether the kernel carries the downstream patch that
+    demands CAP_SYS_ADMIN instead of CAP_PERFMON, and that is not visible in
+    the number.
+
+    Returns ``None`` -- not applicable -- on a host carrying that patch, rather
+    than failing. But it does not take the hardening on trust: it *proves* it,
+    by confirming that CAP_SYS_ADMIN opens the same event the capability was
+    refused. If neither opens it, something other than the known downstream
+    patch is in play and the check fails properly.
+
+    Without the third outcome this returned False on every Debian and Ubuntu
+    host -- including the project's own grounding host -- so the suite could
+    not be run to completion where its measurements were taken.
+    """
+    _, paranoid = _run([], ["cat", "/proc/sys/kernel/perf_event_paranoid"])
+    _, denied = _run(
+        ["--cap-drop", "ALL"], ["python", "-c", _PERF_PROBE], image=PY_IMAGE
+    )
+    _, granted = _run(
+        ["--cap-drop", "ALL", "--cap-add", "PERFMON"],
+        ["python", "-c", _PERF_PROBE],
+        image=PY_IMAGE,
+    )
+    detail = (
+        f"perf_event_paranoid={paranoid.strip()}; without PERFMON="
+        f"{denied.strip()!r} with PERFMON={granted.strip()!r}"
+    )
+    if "PERF_DENIED" not in denied:
+        return False, f"{detail} -- perf is open without the capability"
+    if "PERF_OK" in granted:
+        return True, detail
+    _, admin = _run(
+        ["--cap-drop", "ALL", "--cap-add", "SYS_ADMIN"],
+        ["python", "-c", _PERF_PROBE],
+        image=PY_IMAGE,
+    )
+    if "PERF_OK" in admin:
+        return None, (
+            f"{detail}; with SYS_ADMIN={admin.strip()!r} -- this host carries "
+            "the downstream perf patch (CAP_SYS_ADMIN required instead of "
+            "CAP_PERFMON), proven by the SYS_ADMIN leg, so it cannot ground "
+            "this premise. The reach itself is not in question"
+        )
+    return False, (
+        f"{detail}; with SYS_ADMIN={admin.strip()!r} -- neither capability "
+        "opens the event, which is not the known downstream patch"
+    )
+
+
+# NOTE: CL-0006's ARP-overwrite leg (ADR-020 Appendix A, row 5) is not yet
+# automated. It needs two containers on a shared user-defined bridge, a
+# raw-socket ARP sender, and a victim whose cache is actively cycling — an
+# orchestration this single-container harness has no shape for. The capability
+# gate underneath it (`_t_net_raw`) *is* checked on every run; the overwrite
+# itself is captured evidence in the ADR until a multi-container harness exists.
+# A check returns True (premise held), False (premise refuted) or None (not
+# measurable on this host -- the posture that would prove it is absent). None
+# is reported as SKIP and does not fail the run, because "this host cannot
+# ground this premise" is a different statement from "the premise is wrong".
+CHECKS: list[tuple[str, str, Callable[[], tuple[bool | None, str]]]] = [
     ("CL-0001", "docker socket mount is root-equivalent", _cl0001),
+    (
+        "CL-0001",
+        "premise: :ro socket is still a working API endpoint",
+        _cl0001_ro_socket,
+    ),
     ("CL-0002", "privileged grants full caps", _cl0002),
     ("CL-0003", "no-new-privileges off by default", _cl0003),
     ("CL-0005", "bare published port binds all interfaces", _cl0005),
@@ -700,9 +1019,14 @@ CHECKS: list[tuple[str, str, Callable[[], tuple[bool, str]]]] = [
     ("CL-0009", "seccomp filter active by default", _cl0009),
     ("CL-0010", "pid host exposes host processes", _cl0010),
     ("CL-0011", "cap_add adds the capability", _cl0011),
-    ("CL-0012", "explicit pids limit takes effect", _cl0012),
     ("CL-0013", "host bind mount exposes host path", _cl0013),
+    (
+        "CL-0013",
+        "premise: /dev bind is device-cgroup gated, unlike --device",
+        _cl0013_dev_bind_is_gated,
+    ),
     ("CL-0016", "device exposes a host device", _cl0016),
+    ("CL-0016", "premise: raw host-disk read at default caps", _cl0016_raw_disk),
     ("CL-0017", "shared propagation is observable", _cl0017),
     ("CL-0018", "explicit user maps to that uid", _cl0018),
     ("CL-0022", "tmpfs noexec by default; :exec removes it", _cl0022),
@@ -723,12 +1047,29 @@ CHECKS: list[tuple[str, str, Callable[[], tuple[bool, str]]]] = [
     ("CL-0007", "map: mkdir EROFS -> tmpfs", _t7_mkdir_tmpfs),
     ("CL-0007", "map: masked ENOENT -> tmpfs mountpoint", _t7_tmpfs_creates_mountpoint),
     ("CL-0007", "premise: named volume writable under read_only", _t7_volume_writable),
-    # CL-0012 / CL-0018 / CL-0022 symptom-table mappings (#479).
-    ("CL-0012", "map: fork failure at pids limit", _t12_fork_limit),
+    # CL-0018 / CL-0022 symptom-table mappings (#479).
     ("CL-0022", "map: exec from noexec tmpfs", _t22_exec_tmpfs),
     ("CL-0018", "map: non-root write to root-owned path", _t18_rootfs_write),
     ("CL-0018", "premise: tmpfs inherits image-dir ownership", _t18_tmpfs_inherits),
     ("CL-0018", "premise: named-volume initial ownership", _t18_volume_ownership),
+    # Premises for rules that land later in this release train.
+    (
+        "CL-0025",
+        "premise: rw /proc bind makes core_pattern writable",
+        _cl0025_core_pattern,
+    ),
+    ("CL-0026", "premise: memory and cpu are unbounded by default", _cl0026),
+    ("CL-0027", "premise: SYS_PTRACE traces a different-uid process", _t_sys_ptrace),
+    (
+        "CL-0028",
+        "premise: PERFMON opens system-wide perf, nothing without it",
+        _t_perfmon,
+    ),
+    (
+        "CL-0027",
+        "premise: DAC_READ_SEARCH bypasses an in-container read check",
+        _t_dac_read_search,
+    ),
     # CL-0003 symptom mappings.
     ("CL-0003", "map: setuid bit inert (and silent) under nnp", _t3_setuid_inert),
     ("CL-0003", "premise: root privilege-drop unaffected by nnp", _t3_drop_unaffected),
@@ -785,23 +1126,80 @@ def main() -> int:
             )
             return 1
 
+    departures, opts = _posture()
+    if departures:
+        print(f"  [WARN] posture  NOT at Docker defaults — {opts}")
+        for what, expected, observed in departures:
+            print(f"          · {what}")
+            print(f"              expected: {expected}")
+            print(f"              observed: {observed}")
+        print(
+            "\n"
+            "POSTURE DEPARTS FROM DOCKER'S DEFAULTS — this run is NOT\n"
+            "authoritative, and exits non-zero for that reason alone.\n"
+            "\n"
+            "The checks below still run, and most do not depend on the setting\n"
+            "that departed. But rules are grounded against rootful Docker Engine\n"
+            "at default configuration (ADR-020), so a premise measured here\n"
+            "cannot be cited as evidence for one — and a check that *does*\n"
+            "depend on the departed setting will report a confident, wrong\n"
+            "answer rather than an error. Read the results; do not ground on\n"
+            "them.\n"
+            "\n"
+            "For an authoritative run, use a host at Docker's defaults, or\n"
+            "push the branch and read the `rule-premises` job, which does.\n"
+            "\n"
+            "This says nothing about the security of any deployment. It is about\n"
+            "where the *measurement* was taken. compose-lint never sees the\n"
+            "daemon a compose file will eventually run on (ADR-020), and this\n"
+            "check does not pretend otherwise.",
+            file=sys.stderr,
+        )
+    else:
+        print(f"  [PASS] posture  daemon is at Docker defaults — {opts}")
+
     failures = []
+    skipped = []
     for rule_id, label, check in CHECKS:
         try:
             ok, detail = check()
         except Exception as exc:  # noqa: BLE001 - a crashed check is a failure
             ok, detail = False, f"{type(exc).__name__}: {exc}"
-        mark = "PASS" if ok else "FAIL"
+        mark = "SKIP" if ok is None else ("PASS" if ok else "FAIL")
         print(f"  [{mark}] {rule_id}  {label}\n          {detail}")
-        if not ok:
+        if ok is None:
+            # Not measurable here: the posture that would prove the premise is
+            # absent from this host. Reported, and counted against the run's
+            # authority below, but not a failure — "this host cannot ground
+            # this premise" is not "the premise is wrong".
+            skipped.append(f"{rule_id} ({label})")
+        elif not ok:
             # Include the label: 12 rows share rule_id CL-0006, and a bare
             # "CL-0006, CL-0006" summary hides which mapping broke.
             failures.append(f"{rule_id} ({label})")
 
     print()
     print(f"not runtime-testable (grounded by source): {', '.join(_NON_RUNTIME)}")
+    if skipped:
+        print(f"not measurable on this host: {', '.join(skipped)}")
     if failures:
         print(f"RESULT: FAIL ({len(failures)}): {', '.join(failures)}")
+        return 1
+    if skipped:
+        # Same standing as a posture departure: the run proved everything it
+        # could, and cannot ground what it skipped.
+        print(
+            f"RESULT: NOT AUTHORITATIVE — {len(CHECKS) - len(skipped)} premises "
+            f"held and none failed, but {len(skipped)} could not be measured on "
+            "this host, so this run cannot ground them."
+        )
+        return 1
+    if departures:
+        print(
+            f"RESULT: NOT AUTHORITATIVE — {len(CHECKS)} premises ran and none "
+            "failed, but the daemon is not at Docker's defaults, so this run "
+            "cannot ground a rule. See the posture note above."
+        )
         return 1
     print(f"RESULT: PASS ({len(CHECKS)} premises validated)")
     return 0

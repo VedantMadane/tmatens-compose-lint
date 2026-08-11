@@ -169,7 +169,9 @@ def test_scalar_items_get_lines(tmp_path: Path) -> None:
             ),
             [5, 6, 7],
         ),
-        # CL-0011: cap_add — each dangerous cap on its own line
+        # CL-0011: cap_add — the strong-tier cap on its own line (SYS_ADMIN
+        # moved to CL-0024 in the three-way split, so only NET_ADMIN is this
+        # rule's; the line-attribution behaviour under test is unchanged)
         (
             "CL-0011",
             "compose_lint.rules.CL0011_dangerous_cap_add",
@@ -179,16 +181,31 @@ def test_scalar_items_get_lines(tmp_path: Path) -> None:
                 "  s:\n"
                 "    image: x\n"
                 "    cap_add:\n"
-                "      - SYS_ADMIN\n"
+                "      - BPF\n"
                 "      - NET_ADMIN\n"
             ),
             [5, 6],
         ),
-        # CL-0013: sensitive volumes
+        # CL-0024: the same attribution through the shared cap_add scan
         (
-            "CL-0013",
-            "compose_lint.rules.CL0013_sensitive_mount",
-            "SensitiveMountRule",
+            "CL-0024",
+            "compose_lint.rules.CL0024_host_exec_cap_add",
+            "HostExecCapAddRule",
+            (
+                "services:\n"
+                "  s:\n"
+                "    image: x\n"
+                "    cap_add:\n"
+                "      - SYS_ADMIN\n"
+                "      - SYS_MODULE\n"
+            ),
+            [5, 6],
+        ),
+        # CL-0025: writable root-equivalent volumes (split from CL-0013)
+        (
+            "CL-0025",
+            "compose_lint.rules.CL0025_writable_host_root",
+            "WritableHostRootMountRule",
             (
                 "services:\n"
                 "  s:\n"
@@ -225,7 +242,7 @@ def test_scalar_items_get_lines(tmp_path: Path) -> None:
                 "    image: x\n"
                 "    devices:\n"
                 "      - /dev/sda:/dev/sda\n"
-                "      - /dev/mem:/dev/mem\n"
+                "      - /dev/vda:/dev/vda\n"
             ),
             [5, 6],
         ),

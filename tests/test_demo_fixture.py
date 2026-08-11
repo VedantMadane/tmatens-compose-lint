@@ -26,23 +26,30 @@ DEMO_DIR = Path(__file__).parent.parent / "scripts" / "demo"
 HERO_FIXTURE = DEMO_DIR / "docker-compose.yml"
 FIX_FIXTURE = DEMO_DIR / "fix-compose.yml"
 
-# What the hero GIF (demo.tape) and its descriptions show, severity-sorted as in
-# the text report: CRITICAL socket mount leading, then the sensitive host mount,
-# then the tag-only image pin. The demo also runs `--explain CL-0001`, so the
-# leading finding's rule id is baked into the tape as well.
+# What the hero GIF (demo.tape) and its descriptions show: one finding per tier
+# across two services, so the cast demonstrates the report's per-service
+# grouping as well as its severity sort. The CRITICAL socket mount leads (the
+# demo also runs `--explain CL-0001`, so that rule id is baked into the tape),
+# the HIGH is a plaintext credential — the finding a viewer understands without
+# knowing anything about containers — and the MEDIUM is the tag-only image pin.
 HERO_EXPECTED = {
     ("CL-0001", Severity.CRITICAL),
-    ("CL-0013", Severity.HIGH),
+    ("CL-0020", Severity.HIGH),
     ("CL-0019", Severity.MEDIUM),
 }
 
 # What the fix GIF (fix.tape) shows. Its whole narrative is the split between
-# these two sets: three findings `fix` remediates automatically, and one it
-# refuses because no safe automatic fix exists. The tape's on-screen summary
-# lines ("3 fix(es) available; 1 finding(s) need manual review") quote these
-# counts, and its second screen depends on the leftover being below the default
+# these two sets: four findings `fix` remediates automatically over three edits
+# (CL-0003 and CL-0009 share the `security_opt` rewrite), and one it refuses
+# because no safe automatic fix exists. The tape's on-screen summary line
+# ("3 fix(es) available; 1 finding(s) need manual review") quotes the *edit*
+# count, and its second screen depends on the leftover being below the default
 # HIGH threshold so the re-lint verdict flips FAIL -> PASS.
-FIX_AUTOFIXED = {"CL-0003", "CL-0005", "CL-0007"}
+#
+# The opening FAIL rests on CL-0009 (seccomp:unconfined, HIGH). It used to rest
+# on CL-0005, which moved to MEDIUM when the port-binding rule was recalibrated
+# and stopped crossing the default gate on its own.
+FIX_AUTOFIXED = {"CL-0003", "CL-0005", "CL-0007", "CL-0009"}
 FIX_MANUAL = {"CL-0019"}
 
 
