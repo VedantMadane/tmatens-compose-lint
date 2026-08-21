@@ -156,12 +156,27 @@ def format_header(
     config_path: str | None,
     fail_on: Severity,
     version: str,
+    merged: dict[str, str] | None = None,
 ) -> str:
-    """Format a branded run header showing the tool version and active parameters."""
+    """Format a branded run header showing the tool version and active parameters.
+
+    ``merged`` maps a base file to the overlay Compose merges into it. The
+    header is the one line that states what was read, so a run that read two
+    documents has to say two: naming only the base was the complaint this
+    behaviour exists to answer, and naming it after the merge lands would just
+    move the false claim rather than remove it.
+    """
     sep = _colorize("·", _DIM)
     config_str = _sanitize_line(config_path) if config_path else "none"
+    pairs = merged or {}
+    shown = [
+        f"{_sanitize_line(f)} + {_sanitize_line(pairs[f])}"
+        if f in pairs
+        else _sanitize_line(f)
+        for f in files
+    ]
     params = (
-        f"files: {', '.join(_sanitize_line(f) for f in files)}"
+        f"files: {', '.join(shown)}"
         f"  {sep}  config: {config_str}"
         f"  {sep}  fail-on: {fail_on.value}"
     )
@@ -249,6 +264,15 @@ def format_findings(
         return ""
 
     source_lines = None if quiet else _read_source_lines(filepath)
+    # A merged run grades more than one document, so a finding's line may be a
+    # line in a *different* file. Reading each contributing file once keeps the
+    # excerpt pointing at the text the finding is actually about; rendering
+    # `filepath` for all of them showed an unrelated line with full confidence.
+    extra_sources: dict[str, list[str] | None] = {}
+    if not quiet:
+        for f in findings:
+            if f.source_file and f.source_file not in extra_sources:
+                extra_sources[f.source_file] = _read_source_lines(f.source_file)
 
     by_service: dict[str, list[Finding]] = {}
     for f in findings:
@@ -329,13 +353,23 @@ def format_findings(
                 f"{_colorize(f.rule_id, _DIM)}  "
                 f"{message}{suffix}"
             )
+            if f.source_file:
+                out.append(
+                    f"          {_colorize('in:', _DIM)} {f.source_file}"
+                    f" (merged into this run)"
+                )
 
+            excerpt_source = (
+                extra_sources.get(f.source_file) if f.source_file else source_lines
+            )
             if (
-                source_lines is not None
+                excerpt_source is not None
                 and f.rule_id in _PRESENCE_RULES
                 and f.line is not None
             ):
-                for excerpt_line in _excerpt(f.line, source_lines, message, f.severity):
+                for excerpt_line in _excerpt(
+                    f.line, excerpt_source, message, f.severity
+                ):
                     out.append(f"          {excerpt_line}")
 
             if show_fix and f.fix:

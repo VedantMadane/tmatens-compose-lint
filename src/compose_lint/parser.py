@@ -9,6 +9,7 @@ from typing import Any
 import yaml
 
 from compose_lint._lines import find_ambiguous_break
+from compose_lint._merge import Document, Merged, merge_documents, merge_values
 from compose_lint._safe_read import UnsafeFileError, read_text_bounded
 from compose_lint.config import KNOWN_TOP_LEVEL_KEYS
 from compose_lint.rules._interpolation import substitute_defaults
@@ -171,6 +172,18 @@ class LineLoader(yaml.SafeLoader):
         super().__init__(*args, **kwargs)
         # id(list) -> {index: line}
         self._seq_lines: dict[int, dict[int, int]] = {}
+        # id(mapping) -> {key names carrying `!reset`}. The key is dropped from
+        # the mapping (see `_construct_mapping`), so the only record that it was
+        # ever written is here. A single file does not need it — a deleted key
+        # is simply absent — but a *merge* does: `!reset` deletes the value the
+        # other document supplies, and without this the base's value survives a
+        # deletion Compose honours.
+        self._resets: dict[int, set[str]] = {}
+        # id(mapping) -> {key names carrying `!override`}. Like `!reset`, the
+        # directive changes how the value *merges* rather than what it is, so a
+        # single file needs no record of it — but a merge does: `!override`
+        # replaces the other document's value instead of merging with it.
+        self._overrides: dict[int, set[str]] = {}
 
 
 def _mapping_key(loader: LineLoader, key_node: yaml.Node) -> Any:
@@ -225,6 +238,7 @@ def _reject_duplicate_keys(loader: LineLoader, node: yaml.MappingNode) -> None:
 
 
 _RESET_TAG = "!reset"
+_OVERRIDE_TAG = "!override"
 
 
 def _construct_mapping(loader: LineLoader, node: yaml.MappingNode) -> dict[Any, Any]:
@@ -250,7 +264,11 @@ def _construct_mapping(loader: LineLoader, node: yaml.MappingNode) -> dict[Any, 
                 "Compose files may only use scalar keys",
                 key_node.start_mark,
             ) from e
+        if value_node.tag == _OVERRIDE_TAG and isinstance(key, str):
+            loader._overrides.setdefault(id(mapping), set()).add(key)
         if value_node.tag == _RESET_TAG:
+            if isinstance(key, str):
+                loader._resets.setdefault(id(mapping), set()).add(key)
             # `!reset` deletes the key. Verified with `docker compose config`:
             # a file carrying `read_only: !reset true`, `cap_drop: !reset [ALL]`
             # and `security_opt: !reset [...]` deploys a service with *none* of
@@ -540,8 +558,49 @@ def _collect_lines(
     return lines
 
 
-def _validate_compose(data: Any) -> dict[str, Any]:
-    """Validate that parsed YAML is a Docker Compose file."""
+def _collect_tagged(
+    data: Any, tagged: dict[int, set[str]], prefix: str = ""
+) -> frozenset[str]:
+    """Collect dot-notation paths of keys carrying a Compose merge directive.
+
+    Walks the *raw* document (before :func:`_strip_lines` rebuilds it, which
+    would invalidate the id() keys) with the same iterative work-stack shape as
+    :func:`_collect_lines`.
+    """
+    if not tagged:
+        return frozenset()
+    found: set[str] = set()
+    expanded: set[int] = set()
+    stack: list[tuple[Any, str]] = [(data, prefix)]
+    while stack:
+        current, current_prefix = stack.pop()
+        if isinstance(current, dict):
+            for key in tagged.get(id(current), ()):
+                found.add(f"{current_prefix}.{key}" if current_prefix else key)
+            if id(current) in expanded:
+                continue
+            expanded.add(id(current))
+            for key, value in current.items():
+                if key is _LINES:
+                    continue
+                stack.append(
+                    (value, f"{current_prefix}.{key}" if current_prefix else key)
+                )
+        elif isinstance(current, list):
+            if id(current) in expanded:
+                continue
+            expanded.add(id(current))
+            for i, item in enumerate(current):
+                stack.append((item, f"{current_prefix}[{i}]"))
+    return frozenset(found)
+
+
+def _validate_compose(data: Any, *, merging: bool = False) -> dict[str, Any]:
+    """Validate that parsed YAML is a Docker Compose file.
+
+    ``merging`` relaxes the per-service check for a document that is one
+    half of a merge, where a service may legitimately carry no body.
+    """
     if not isinstance(data, dict):
         raise ComposeError(
             "Not a valid Compose file: expected a YAML mapping at the top level"
@@ -556,6 +615,13 @@ def _validate_compose(data: Any) -> dict[str, Any]:
 
     for name, config in services.items():
         if name is _LINES:
+            continue
+        if config is None and merging:
+            # `web:` with no body is a legal overlay half — verified against
+            # `docker compose config`, which merges it as "no changes to web"
+            # and deploys the base unaltered. Refusing it failed the *pair*,
+            # so a valid stack did not lint at all. Standalone files keep the
+            # stricter rule: a service with no body cannot run on its own.
             continue
         if not isinstance(config, dict):
             raise ComposeError(
@@ -629,6 +695,7 @@ def _resolve_in_file_extends(data: dict[str, Any]) -> None:
     if not isinstance(services, dict):
         return
     resolved: dict[str, Any] = {}
+    memo: dict[tuple[int, int, str], Any] = {}
 
     def _resolve(name: str, stack: tuple[str, ...]) -> Any:
         if name in resolved:
@@ -653,7 +720,12 @@ def _resolve_in_file_extends(data: dict[str, Any]) -> None:
             resolved[name] = cfg
             return cfg
         parent = _resolve(target, (*stack, name))
-        merged = _merge_extends(parent, cfg)  # keeps child's `extends` marker
+        # Compose resolves `extends:` with the same field-specific merge it uses
+        # for multi-file overlays (verified against `docker compose config` in
+        # tests/test_merge_semantics.py), so both go through one table. The
+        # previous concatenate-every-sequence merge reported a CRITICAL socket
+        # mount against a child that had replaced it at the same mount point.
+        merged = merge_values(parent, cfg, memo=memo)  # keeps child's `extends` marker
         resolved[name] = merged
         return merged
 
@@ -952,9 +1024,9 @@ def load_compose(
     return loads(content, base_dir=filepath.absolute().parent)
 
 
-def loads(
-    content: str, base_dir: Path | None = None
-) -> tuple[dict[str, Any], dict[str, int]]:
+def _loads_full(
+    content: str, base_dir: Path | None = None, *, merging: bool = False
+) -> tuple[dict[str, Any], dict[str, int], frozenset[str], frozenset[str]]:
     """Parse and validate Compose from an in-memory string.
 
     The string form of :func:`load_compose`: identical YAML parsing, line
@@ -1005,6 +1077,8 @@ def loads(
         loader = LineLoader(content)  # noqa: S506  # nosec B506 - SafeLoader subclass
         raw = loader.get_single_data()
         seq_lines = loader._seq_lines
+        raw_resets = loader._resets
+        raw_overrides = loader._overrides
     except yaml.YAMLError as e:
         raise ComposeError(f"Invalid YAML: {e}") from e
     except RecursionError as e:
@@ -1022,7 +1096,7 @@ def loads(
     if raw is None:
         raise ComposeError("Not a valid Compose file: file is empty")
 
-    _validate_compose(raw)
+    _validate_compose(raw, merging=merging)
 
     # The post-parse passes recurse too, and the guard above covered only the
     # parse. A 2000-deep `extends:` chain, or a self-referential
@@ -1032,6 +1106,8 @@ def loads(
     # each pass that walks the document, not only the one that builds it.
     try:
         lines = _collect_lines(raw, seq_lines)
+        reset_paths = _collect_tagged(raw, raw_resets)
+        override_paths = _collect_tagged(raw, raw_overrides)
         data = _strip_lines(raw)
         # Canonicalize before anything classifies: rules and the extends and
         # bind-source passes below all see the value the file actually ships
@@ -1047,4 +1123,74 @@ def loads(
             "`${VAR}` default)"
         ) from e
 
+    return data, lines, reset_paths, override_paths
+
+
+def loads(
+    content: str, base_dir: Path | None = None
+) -> tuple[dict[str, Any], dict[str, int]]:
+    """Parse Compose from a string, returning ``(data, lines)``.
+
+    The public string entry point. :func:`_loads_full` additionally reports the
+    paths deleted by ``!reset``, which only a merge needs.
+    """
+    data, lines, _, _ = _loads_full(content, base_dir=base_dir)
     return data, lines
+
+
+def load_document(path: str | Path) -> Document:
+    """Load one Compose file as a :class:`Document` ready to merge.
+
+    The merge-aware sibling of :func:`load_compose`: same parse, same
+    validation, but it keeps the ``!reset`` deletions that only matter once a
+    second document is folded in.
+    """
+    filepath = Path(path)
+    try:
+        content = read_text_bounded(filepath, newline="")
+    except UnsafeFileError as e:
+        raise ComposeError(str(e)) from e
+    except UnicodeDecodeError as e:
+        raise ComposeError(f"Invalid encoding: file is not valid UTF-8 ({e})") from e
+    except OSError as e:
+        raise ComposeError(f"Cannot read file: {e}") from e
+    data, lines, resets, overrides = _loads_full(
+        content, base_dir=filepath.absolute().parent, merging=True
+    )
+    return Document(
+        path=str(path), data=data, lines=lines, resets=resets, overrides=overrides
+    )
+
+
+def load_merged(paths: list[str | Path]) -> Merged:
+    """Load and merge several Compose files into the configuration Compose runs.
+
+    Later paths override earlier ones, which is the order Compose itself uses
+    for ``-f a -f b`` and for a base file plus its ``compose.override.yml``.
+    """
+    return merge_documents([load_document(p) for p in paths])
+
+
+def merge_patched(
+    patched: str, base_path: str | Path, overlays: list[str]
+) -> tuple[dict[str, Any], dict[str, int]]:
+    """Re-merge a candidate patch of ``base_path`` with its overlay documents.
+
+    The verification counterpart of :func:`load_merged`. ``fix`` proposes an
+    edit to the base file's *text*; the property that has to hold afterwards is
+    about the document Compose would run, so the candidate is merged with the
+    same overlays before the engine re-runs over it.
+    """
+    base_dir = Path(base_path).absolute().parent
+    data, lines, resets, overrides = _loads_full(
+        patched, base_dir=base_dir, merging=True
+    )
+    candidate = Document(
+        path=str(base_path),
+        data=data,
+        lines=lines,
+        resets=resets,
+        overrides=overrides,
+    )
+    merged = merge_documents([candidate, *(load_document(p) for p in overlays)])
+    return merged.data, merged.lines
