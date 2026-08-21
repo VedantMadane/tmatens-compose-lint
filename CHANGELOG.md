@@ -22,6 +22,11 @@ the previous single-file grading exactly.
 
 ### Added
 
+- Contract tests pin the JSON envelope and the SARIF log shape, the two
+  surfaces `docs/compatibility.md` freezes at 1.0 that nothing enforced.
+  `SCHEMA_VERSION` is pinned to its literal value, so a silent bump fails;
+  additive keys stay allowed, renames and removals now require editing the
+  contract on purpose.
 - `check` and `fix` merge a sibling `compose.override.yml` and lint the
   effective configuration (ADR-025). The run header names both documents, and
   a note on stderr states what was merged; the exit code is unchanged, because
@@ -39,6 +44,12 @@ the previous single-file grading exactly.
 
 ### Fixed
 
+- CL-0005 includes a non-default protocol in a long-syntax port's evidence.
+  Two publishings of one container port that differ only by protocol — the
+  standard shape for a DNS service — derived the same evidence, so SARIF gave
+  them one `partialFingerprints` digest and Code Scanning displayed one alert
+  instead of two. `tcp` is still not spelled out, so no existing alert is
+  re-keyed. Text and JSON always reported both findings.
 - `extends:` no longer concatenates every sequence. Compose merges `volumes`
   and `devices` by container path, replaces `command`/`entrypoint`, and
   deduplicates the append-style sequences; concatenating reported a CRITICAL
