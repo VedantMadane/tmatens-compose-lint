@@ -369,3 +369,59 @@ class TestReadEnvFile:
     def test_a_directory_is_none(self, tmp_path: Path) -> None:
         (tmp_path / "app.env").mkdir()
         assert read_env_file(tmp_path / "app.env") is None
+
+
+# --- A quoted value may span lines, and its lines are not entries ---------
+#
+# godotenv -- and therefore Compose -- lets a quoted value contain newlines.
+# Reading the physical lines after the opening quote as entries is the
+# scope-smuggling hole ADR-026 section 4 exists to close, arriving by the one
+# route `_split_env_lines` left open: a `.env` whose *value text* contains a
+# `COMPOSE_FILE=` line offered compose-lint a document set Compose never sees.
+
+_SMUGGLED = 'NOTE="release notes:\nCOMPOSE_FILE=compose.yml:scrub.yml\nend"\n'
+
+
+def test_a_compose_file_inside_a_quoted_value_is_not_an_entry() -> None:
+    parsed = parse_env(_SMUGGLED, wanted=None)
+    assert "COMPOSE_FILE" not in parsed.values
+    assert "COMPOSE_FILE" not in parsed.unresolved
+    assert (
+        parsed.values["NOTE"]
+        == "release notes:\nCOMPOSE_FILE=compose.yml:scrub.yml\nend"
+    )
+
+
+def test_a_single_quoted_value_spans_lines_too() -> None:
+    parsed = parse_env("NOTE='a\nCOMPOSE_FILE=evil.yml\nend'\nK=v\n", wanted=None)
+    assert "COMPOSE_FILE" not in parsed.values
+    assert parsed.values["K"] == "v"
+
+
+def test_an_entry_after_a_multiline_value_is_still_read() -> None:
+    """The scanner must resume, not swallow the rest of the file."""
+    parsed = parse_env(_SMUGGLED + "AFTER=yes\n", wanted=None)
+    assert parsed.values["AFTER"] == "yes"
+
+
+def test_an_escaped_quote_does_not_close_a_double_quoted_value() -> None:
+    parsed = parse_env('A="a\\"b"\nB=v\n', wanted=None)
+    assert parsed.values["B"] == "v"
+
+
+def test_a_single_quoted_value_takes_no_escapes() -> None:
+    """godotenv treats a single-quoted body as literal, so the first quote closes."""
+    parsed = parse_env("A='a\\'\nB=v\n", wanted=None)
+    assert parsed.values["B"] == "v"
+
+
+def test_an_unterminated_quote_consumes_the_rest_of_the_file() -> None:
+    """Which is what Compose does with one too."""
+    parsed = parse_env('A="never closed\nB=v\n', wanted=None)
+    assert "B" not in parsed.values
+
+
+def test_a_single_line_quoted_value_is_unchanged() -> None:
+    parsed = parse_env('A="one line"\nB="v # keep"\n', wanted=None)
+    assert parsed.values["A"] == "one line"
+    assert parsed.values["B"] == "v # keep"

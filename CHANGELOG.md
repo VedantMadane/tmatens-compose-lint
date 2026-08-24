@@ -37,6 +37,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CL-0009 `security_opt` normalizer and CL-0010's namespace comparison now do
   too — 35.85s to 90ms. A list is not a value any of those fields can hold, so
   the entry is skipped rather than compared.
+- **A pull request can no longer choose its own lint scope through a quoted
+  `.env` value.** godotenv — and therefore Compose — lets a quoted value span
+  lines, so the physical lines after the opening quote are value *text*, not
+  entries. `_scan` read them as entries, which handed an untrusted contributor
+  the one thing [ADR-026](docs/adr/026-read-the-sibling-env-file.md) §4 forbids:
+  a `COMPOSE_FILE` compose-lint honours and Compose never sees. Three committed
+  files were enough — a `.env` whose value text carries
+  `COMPOSE_FILE=compose.yml:scrub.yml`, and a `scrub.yml` that `!reset`s the
+  dangerous keys — turning a privileged, socket-mounting service from two
+  CRITICAL findings into `✓ PASS` and exit 0, including in the explicit-file
+  form the GitHub Action and the pre-commit hook use. `docker compose config`
+  was never fooled; only compose-lint was. The scanner is now value-aware for
+  both quote styles, with double-quote escapes honoured, and an unterminated
+  quote consumes the rest of the file exactly as Compose does. This is the same
+  failure `_split_env_lines` already closed for `\r`, by the route left open
+  for `\n`.
 
 ## [0.24.0] - 2026-08-24
 

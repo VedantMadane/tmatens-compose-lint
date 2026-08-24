@@ -265,6 +265,76 @@ def _split_env_lines(text: str) -> list[str]:
     return text.split("\n")
 
 
+def _closing_quote(value: str, quote: str) -> bool:
+    """Whether ``value`` — which opens with ``quote`` — also closes it.
+
+    A backslash escapes the next character inside a double-quoted value, so
+    ``"a\\"b"`` is one value rather than two. Single quotes take no escapes
+    (godotenv, and Compose 5.4.0, treat the body as literal), so the first
+    ``'`` closes it.
+    """
+    index = 1
+    while index < len(value):
+        char = value[index]
+        if quote == '"' and char == "\\":
+            index += 2
+            continue
+        if char == quote:
+            return True
+        index += 1
+    return False
+
+
+def _join_multiline_values(lines: list[str]) -> list[tuple[int, str]]:
+    """Group physical lines into entries, honouring values that span lines.
+
+    godotenv — and therefore Compose — lets a quoted value contain newlines,
+    so the physical lines after the opening quote are *value text*, not
+    entries. Reading them as entries is the scope-smuggling hole ADR-026 §4
+    exists to close, arriving by the one route :func:`_split_env_lines` left
+    open. A ``.env`` carrying::
+
+        NOTE="release notes:
+        COMPOSE_FILE=compose.yml:scrub.yml
+        end"
+
+    sets only ``NOTE``; Compose never sees a ``COMPOSE_FILE``. compose-lint
+    did, so a pull request could add a document that ``!reset``s the dangerous
+    keys and select it into its own lint — turning two CRITICAL findings into
+    a green gate (verified against ``docker compose config`` 5.4.0).
+
+    Returns ``(line_number, text)`` pairs where ``text`` may contain newlines.
+    An unterminated quote consumes the rest of the file, which is what Compose
+    does with one too.
+    """
+    grouped: list[tuple[int, str]] = []
+    index = 0
+    total = len(lines)
+    while index < total:
+        number = index + 1
+        line = lines[index]
+        stripped = _EXPORT_RE.sub("", line.strip())
+        _key, separator, value = stripped.partition("=")
+        value = value.strip()
+        quote = value[:1]
+        if separator and quote in ('"', "'") and not _closing_quote(value, quote):
+            buffer = [line]
+            index += 1
+            while index < total:
+                buffer.append(lines[index])
+                # The continuation closes when this line carries the quote,
+                # scanned with the same escape rules as the opening line.
+                if _closing_quote(quote + lines[index], quote):
+                    break
+                index += 1
+            grouped.append((number, "\n".join(buffer)))
+            index += 1
+            continue
+        grouped.append((number, line))
+        index += 1
+    return grouped
+
+
 def _scan(text: str, *, raw: bool = False) -> tuple[list[_Entry], list[int]]:
     """Split text into entries as written, plus the lines that are not entries.
 
@@ -277,7 +347,13 @@ def _scan(text: str, *, raw: bool = False) -> tuple[list[_Entry], list[int]]:
     skipped: list[int] = []
     # `\ufeff` is a BOM on the first line; Compose tolerates one (verified), and
     # left in place it would become part of the first key.
-    for number, line in enumerate(_split_env_lines(text.lstrip("\ufeff")), start=1):
+    physical = _split_env_lines(text.lstrip("\ufeff"))
+    # `format: raw` is a different grammar with no quoting at all, so a value
+    # never spans lines there and each physical line is its own entry.
+    numbered = (
+        list(enumerate(physical, start=1)) if raw else _join_multiline_values(physical)
+    )
+    for number, line in numbered:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
