@@ -636,7 +636,12 @@ def _run_check(args: argparse.Namespace) -> NoReturn:
         try:
             _stdout_print(load_rule_doc(args.explain))
         except UnknownRuleError:
-            emit(f"Error: unknown rule id '{args.explain}' (expected format: CL-XXXX)")
+            rid = args.explain
+            import re as _re
+            if not _re.fullmatch(r"CL-\d{4}", rid or ""):
+                emit(f"Error: invalid rule id '{rid}' (expected format: CL-XXXX)")
+            else:
+                emit(f"Error: unknown rule id '{rid}'")
             sys.exit(2)
         sys.exit(0)
 
