@@ -220,7 +220,7 @@ def _parse_rules(
     if rules is None:
         rules = {}
     if not isinstance(rules, dict):
-        raise ConfigError(\"'rules' must be a mapping\")
+        raise ConfigError("'rules' must be a mapping")
 
     disabled: dict[str, str | None] = {}
     overrides: dict[str, Severity] = {}
