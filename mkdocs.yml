@@ -78,6 +78,9 @@ nav:
       - "The clean one": examples/clean-edge-proxy/index.md
   - Guides:
       - Configuration: configuration.md
+      - "CLI reference": cli.md
+      - "Fixing findings": fix.md
+      - "Forgejo Actions": forgejo.md
       - Severity levels: severity.md
       - Hardening walkthrough: hardening.md
       - Compatibility: compatibility.md
