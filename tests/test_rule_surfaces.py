@@ -27,16 +27,12 @@ from pathlib import Path
 
 import pytest
 
+from compose_lint.explain import FALLOW
 from compose_lint.rules import get_registered_rules
 
 REPO = Path(__file__).parent.parent
 
 REGISTERED = {cls().metadata.id for cls in get_registered_rules()}
-
-# Ids that were used and retired. They must NOT reappear: reusing one silently
-# rewrites the meaning of a suppression someone already wrote (ADR-005), and
-# pre-1.0 reclamation ended with CL-0023.
-FALLOW = {"CL-0012", "CL-0015", "CL-0023"}
 
 
 def _listed(path: str, pattern: str) -> set[str]:

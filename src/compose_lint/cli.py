@@ -635,11 +635,12 @@ def _run_check(args: argparse.Namespace) -> NoReturn:
             sys.exit(2)
         try:
             _stdout_print(load_rule_doc(args.explain))
-        except UnknownRuleError:
-            rid = args.explain
-            import re as _re
-            if not _re.fullmatch(r"CL-\d{4}", rid or ""):
-                emit(f"Error: invalid rule id '{rid}' (expected format: CL-XXXX)")
+        except UnknownRuleError as exc:
+            rid = exc.rule_id
+            if exc.kind == "malformed":
+                emit(f"Error: unknown rule id '{rid}' (expected format: CL-XXXX)")
+            elif exc.kind == "retired":
+                emit(f"Error: rule id '{rid}' was retired and is not reused")
             else:
                 emit(f"Error: unknown rule id '{rid}'")
             sys.exit(2)

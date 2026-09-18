@@ -354,6 +354,28 @@ class TestCLI:
         assert result.returncode == 2
         assert "unknown rule id" in result.stderr.lower()
         assert "CL-9999" in result.stderr
+        # Well-formed but missing: no format hint (issue #725).
+        assert "expected format" not in result.stderr
+
+    def test_explain_unknown_rule_accepts_lowercase(self) -> None:
+        # Lowercase well-formed ids must not be reported as malformed.
+        result = run_cli("--explain", "cl-9999")
+        assert result.returncode == 2
+        assert "unknown rule id 'CL-9999'" in result.stderr
+        assert "expected format" not in result.stderr
+
+    def test_explain_retired_rule_id(self) -> None:
+        result = run_cli("--explain", "CL-0012")
+        assert result.returncode == 2
+        assert "retired" in result.stderr.lower()
+        assert "CL-0012" in result.stderr
+        assert "expected format" not in result.stderr
+
+    def test_explain_retired_rule_id_lowercase(self) -> None:
+        result = run_cli("--explain", "cl-0012")
+        assert result.returncode == 2
+        assert "retired" in result.stderr.lower()
+        assert "CL-0012" in result.stderr
 
     def test_explain_rejects_structured_format(self) -> None:
         for fmt in ("json", "sarif"):
@@ -365,7 +387,8 @@ class TestCLI:
     def test_explain_rejects_malformed_id(self) -> None:
         result = run_cli("--explain", "not-a-rule")
         assert result.returncode == 2
-        assert result.stderr
+        assert "unknown rule id 'not-a-rule'" in result.stderr
+        assert "expected format: CL-XXXX" in result.stderr
 
     def test_explain_rejects_file_argument(self) -> None:
         result = run_cli("--explain", "CL-0003", str(FIXTURES / "valid_basic.yml"))

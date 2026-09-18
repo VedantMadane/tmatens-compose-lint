@@ -22,8 +22,9 @@ from compose_lint.models import Severity
 KNOWN_TOP_LEVEL_KEYS = frozenset({"rules"})
 
 # Recognized keys inside a per-rule block. A key outside this set (a typo'd
-# `severty:` or a `reason:` with no `enabled: false`) is silently inert today;
-# warn so the user learns their override never took effect (issue #279 G1).
+# `severty:`) is silently inert; warn so the user learns their override never
+# took effect (issue #279 G1). A lone `reason:` without `enabled: false` is
+# checked separately below (issue #723).
 _KNOWN_RULE_KEYS = frozenset({"enabled", "reason", "severity", "exclude_services"})
 
 
@@ -230,6 +231,8 @@ def _parse_rules(
     for rule_id, rule_config in rules.items():
         rule_id = str(rule_id)
 
+        if rule_config is None:
+            rule_config = {}
         if not isinstance(rule_config, dict):
             raise ConfigError(f"Config for rule '{rule_id}' must be a mapping")
 
@@ -261,6 +264,16 @@ def _parse_rules(
                     rule_config.get("reason"), rule_id, "reason"
                 )
 
+        # A reason without enabled: false is known-key but inert — the user
+        # likely thinks the rule is suppressed. Warn (issue #723). Per-service
+        # reasons under exclude_services are unrelated and must not trip this.
+        if "reason" in rule_config and rule_config.get("enabled") is not False:
+            _warn(
+                f"config: rule '{rule_id}' has 'reason' without 'enabled: false'; "
+                "the reason has no effect",
+                strict,
+            )
+
         if "severity" in rule_config:
             severity_text = _scalar_field(rule_config["severity"], rule_id, "severity")
             if severity_text is None:
@@ -279,8 +292,10 @@ def _parse_exclude_services(rule_id: str, value: Any) -> dict[str, str | None]:
     """Parse an exclude_services entry into a service-name → reason mapping.
 
     Accepts either a list of service names (no reasons) or a mapping of
-    service name to reason string.
+    service name to reason string. Explicit null is treated as empty.
     """
+    if value is None:
+        return {}
     if isinstance(value, list):
         result: dict[str, str | None] = {}
         for item in value:

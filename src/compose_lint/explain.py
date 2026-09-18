@@ -14,9 +14,26 @@ from pathlib import Path
 
 _RULE_ID_RE = re.compile(r"^CL-\d{4}$")
 
+# Ids that were used and retired under ADR-028. Never reuse: reusing one
+# silently rewrites the meaning of a suppression someone already wrote
+# (ADR-005). Shared with tests/test_rule_surfaces.py.
+FALLOW = frozenset({"CL-0012", "CL-0015", "CL-0023"})
+
 
 class UnknownRuleError(ValueError):
-    """Raised when a rule id has no corresponding documentation file."""
+    """Raised when a rule id cannot be resolved to documentation.
+
+    ``kind`` distinguishes the three reporting cases for ``--explain``:
+
+    - ``"malformed"`` ? input does not match ``CL-XXXX``
+    - ``"unknown"`` ? well-formed id with no rule
+    - ``"retired"`` ? well-formed id that was permanently withdrawn (fallow)
+    """
+
+    def __init__(self, rule_id: str, *, kind: str) -> None:
+        super().__init__(rule_id)
+        self.rule_id = rule_id
+        self.kind = kind
 
 
 def normalize_rule_id(raw: str) -> str:
@@ -27,7 +44,7 @@ def normalize_rule_id(raw: str) -> str:
     """
     candidate = raw.strip().upper()
     if not _RULE_ID_RE.match(candidate):
-        raise UnknownRuleError(raw)
+        raise UnknownRuleError(raw, kind="malformed")
     return candidate
 
 
@@ -49,4 +66,6 @@ def load_rule_doc(rule_id: str) -> str:
     if repo_copy.is_file():
         return repo_copy.read_text(encoding="utf-8")
 
-    raise UnknownRuleError(canonical)
+    if canonical in FALLOW:
+        raise UnknownRuleError(canonical, kind="retired")
+    raise UnknownRuleError(canonical, kind="unknown")
